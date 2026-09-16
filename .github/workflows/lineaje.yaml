@@ -30,7 +30,7 @@ jobs:
 
       - name: Prepare scanner
         run: |
-          cp .github/scripts/scm_unifai_scan.py /tmp/scm_unifai_scan.py
+          cp .github/scm_unifai_scan_hybrid.py /tmp/scm_unifai_scan_hybrid.py
           rm -rf .github .git
 
       - name: Run Lineaje AI policy scan
@@ -39,7 +39,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           MCP_TLS_INSECURE_SKIP_VERIFY: "1"
         run: |
-          python /tmp/scm_unifai_scan.py \
+          python /tmp/scm_unifai_scan_hybrid.py \
             --source-path . \
             --repo ${{ github.repository }} \
             --branch ${{ github.ref_name }} \
