@@ -14,7 +14,7 @@ permissions:
 
 jobs:
   lineaje-scan:
-    runs-on: self-hosted
+    runs-on: unifai
 
     steps:
       - name: Checkout repository
