@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       create_fix_pr:
-        description: "Open a remediation PR with the suggested fixes"
+        description: "Open a remediation PR with the stubs and guardrails"
         type: boolean
         default: true
 
@@ -44,5 +44,5 @@ jobs:
             --repo ${{ github.repository }} \
             --branch ${{ github.ref_name }} \
             --head-sha ${{ github.sha }} \
-            --mcp-server-url https://172.19.0.68/mcp \
+            --mcp-server-url https://localhost/mcp \
             ${{ inputs.create_fix_pr && '--create-fix-pr' || '' }} >> "$GITHUB_STEP_SUMMARY"
