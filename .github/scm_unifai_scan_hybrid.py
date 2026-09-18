@@ -126,10 +126,6 @@ def _mcp_http_client_with_extra_ca(headers=None, timeout=None, auth=None):
         verify = ctx
 
     kwargs: Dict[str, Any] = {"follow_redirects": True, "verify": verify}
-    # streamablehttp_client (mcp SDK) always passes an explicit httpx.Timeout here
-    # (built from its own timeout/sse_read_timeout params) — this default (matching
-    # the SDK's own bare defaults: 30s connect, 300s read) only matters if this
-    # factory is ever called directly.
     kwargs["timeout"] = timeout if timeout is not None else httpx.Timeout(30, read=300)
     if headers is not None:
         kwargs["headers"] = headers
@@ -138,18 +134,7 @@ def _mcp_http_client_with_extra_ca(headers=None, timeout=None, auth=None):
     return httpx.AsyncClient(**kwargs)
 
 
-# ``streamablehttp_client`` (this exact name) was a deprecated alias for the
-# canonical ``streamable_http_client`` in the ``mcp`` PyPI package. Some ``mcp``
-# releases have removed the deprecated alias outright, which breaks on any
-# environment that installs ``mcp`` unpinned (e.g. a fresh host picking up
-# whatever's newest — confirmed live: mcp==2.2.0 raises "ImportError: cannot
-# import name 'streamablehttp_client' from 'mcp.client.streamable_http'").
-# Reimplemented here against the still-supported ``streamable_http_client`` so
-# the call sites below keep working unchanged regardless of which alias the
-# installed mcp version kept. Logic mirrors the (now possibly-removed)
-# deprecated wrapper's own implementation exactly — same signature, same
-# behavior — and defaults to _mcp_http_client_with_extra_ca so the CA/insecure
-# handling above still applies without every call site repeating it.
+
 from contextlib import asynccontextmanager as _asynccontextmanager
 from datetime import timedelta as _timedelta
 
@@ -181,12 +166,6 @@ async def _streamablehttp_client_compat(
         async with streamable_http_client(
             url, http_client=client, terminate_on_close=terminate_on_close,
         ) as streams:
-            # mcp==2.2.0's streamable_http_client yields a 2-tuple
-            # (read_stream, write_stream) — the get_session_id_callback third
-            # element was dropped from the yield entirely (older/other mcp
-            # versions may still yield 3). Normalize to 3 here so every call
-            # site's `async with ... as (read, write, _):` keeps working
-            # unchanged regardless of which shape the installed version uses.
             if len(streams) == 2:
                 streams = (*streams, None)
             yield streams
@@ -586,7 +565,7 @@ def create_batch_archive(
     source_code_repo: str,
     branch: str,
     head_sha: str,
-    batch_index: int = 0,
+    batch_index: Any = 0,
     run_id: str = "",
 ) -> str:
     archive_path = os.path.join(archive_dir, f"repo_scan_batch_{batch_index}.zip")
@@ -606,7 +585,7 @@ def create_batch_archive(
         }
         zf.writestr("user_metadata.json", json.dumps(metadata, indent=2))
     size_kb = os.path.getsize(archive_path) // 1024
-    logger.info("Batch archive #%d: %d files, %d KB", batch_index, len(file_subset), size_kb)
+    logger.info("Batch archive #%s: %d files, %d KB", batch_index, len(file_subset), size_kb)
     return archive_path
 
 
@@ -715,6 +694,38 @@ def _upload_to_s3(presigned_url: str, archive_path: str) -> None:
             if resp.status not in (200, 204):
                 raise RuntimeError(f"S3 upload failed: HTTP {resp.status}")
     logger.debug("S3 upload complete")
+
+
+def _is_payload_too_large(exc: BaseException) -> bool:
+    """True when exc is (or wraps) an HTTP 413 from the MCP endpoint.
+
+    The ``mcp`` SDK's StreamableHTTPSessionManager hard-caps request bodies at
+    4 MiB and 413s anything bigger before it ever reaches application code —
+    archive_content_base64 (used in hybrid mode, where source never touches
+    S3) routes the whole archive through that same request body, so a batch
+    whose files happen to be large enough hits this cap. Retrying the
+    identical payload would just 413 again; the caller should split the batch
+    in half instead.
+    """
+    cause = exc
+    while hasattr(cause, "exceptions") and cause.exceptions:
+        cause = cause.exceptions[0]
+    try:
+        import httpx
+        if isinstance(cause, httpx.HTTPStatusError) and cause.response is not None:
+            return cause.response.status_code == 413
+    except Exception:
+        pass
+    text = str(cause)
+    return "413" in text and ("Request Entity Too Large" in text or "Request body too large" in text)
+
+
+def _split_batch_in_half(batch_files: List[str]) -> Optional[Tuple[List[str], List[str]]]:
+    """Split a 413-retry batch in half. None when it cannot be split further."""
+    if len(batch_files) < 2:
+        return None
+    mid = len(batch_files) // 2
+    return batch_files[:mid], batch_files[mid:]
 
 
 def _loads_scan_payload(raw: str) -> dict:
@@ -998,8 +1009,6 @@ def apply_stub_insertions_to_clone(
             lines = fh.readlines()
         ext = pathlib.Path(rel_path).suffix.lower()
 
-        # Insert bottom-up so an earlier insertion never shifts a later hit's
-        # (already-captured) line number out from under it.
         sorted_hits = sorted(_collapse_stub_hits(hits), key=lambda h: h.get("line", 0), reverse=True)
         needs_import = False
         for hit in sorted_hits:
@@ -1074,7 +1083,7 @@ def _ensure_refresh_token_in_validated_fixes(
         data = {}
     existing = str(data.get("refreshtoken") or data.get("refresh_token") or "").strip()
     keep = _usable_scan_refresh_token(existing)
-    token = keep or rt
+    token = rt or keep
     if not token:
         logger.warning(
             "No SCIM refresh token for %s — set LINEAJE_PAT_TOKEN "
@@ -1083,7 +1092,14 @@ def _ensure_refresh_token_in_validated_fixes(
         )
         return
     data.setdefault("contract_version", "2.0")
-    base = str(data.get("gr_service_url") or "").strip().rstrip("/") or _HARDCODED_GR_ORIGIN
+    # Likewise: this script's own MCP_SERVER_URL origin (_HARDCODED_GR_ORIGIN,
+    # the VM this scan actually ran against) wins over whatever gr_service_url
+    # the server wrote. The server's own resolver deliberately excludes
+    # loopback origins (e.g. --mcp-server-url https://localhost/mcp, used to
+    # route around Azure's public-IP hairpin-NAT limitation) and falls back to
+    # its hardcoded hosted SaaS origin instead — which is never reachable from
+    # wherever the customer's own runtime guardrail stub actually executes.
+    base = _HARDCODED_GR_ORIGIN or str(data.get("gr_service_url") or "").strip().rstrip("/")
     data["gr_service_url"] = base
     data["enforce_endpoint"] = f"{base}/enforce"
     data["refreshtoken"] = token
@@ -1135,8 +1151,8 @@ def _run_mcp_scan_via_client(
         resolved_run_id = (run_id or "").strip()
         if resolved_run_id:
             upload_args["run_id"] = resolved_run_id
-        # Only known to the SCM/CI script — surfaces the pipeline's own commit
-        # sha to the server the same way gha_repo_scan.py does.
+        with open(archive_path, "rb") as _fh:
+            upload_args["archive_content_base64"] = base64.b64encode(_fh.read()).decode("ascii")
         scm_headers: Dict[str, str] = {"X-Unifai-Commit-Sha": head_sha} if head_sha else {}
 
         tok1 = bearer_getter()
@@ -1156,8 +1172,10 @@ def _run_mcp_scan_via_client(
                 resolved_sbom = (upload_result.get("sbom_id") or resolved_sbom or "").strip()
                 resolved_run_id = (upload_result.get("run_id") or resolved_run_id or "").strip()
 
-        # logger.info("MCP step 2/3: upload to S3")
-        _upload_to_s3(presigned_url, archive_path)
+
+        if presigned_url:
+            # logger.info("MCP step 2/3: upload to S3")
+            _upload_to_s3(presigned_url, archive_path)
 
         tok2 = bearer_getter()
         sse_timeout = int(os.environ.get("UNIFAI_MCP_SSE_READ_TIMEOUT", "1800"))
@@ -1243,12 +1261,12 @@ def parallel_batch_scan(
     lock = threading.Lock()
     scan_sbom_id = ""
 
-    def _scan_one(batch_idx: int, batch_files: List[str]) -> Tuple[int, Dict[str, Any]]:
+    def _scan_leaf(label: str, batch_files: List[str]) -> Dict[str, Any]:
         nonlocal scan_sbom_id
-        logger.info("Batch %d/%d: %d files", batch_idx, len(batches), len(batch_files))
+        logger.info("Batch %s/%d: %d files", label, len(batches), len(batch_files))
         archive_path = create_batch_archive(
             source_dir, temp_dir, batch_files,
-            source_code_repo, branch, head_sha, batch_idx, run_id=run_id,
+            source_code_repo, branch, head_sha, label, run_id=run_id,
         )
         result = run_mcp_scan(
             server_url, bearer_getter, source_code_repo, branch, batch_files, archive_path,
@@ -1258,9 +1276,32 @@ def parallel_batch_scan(
             resolved_sbom = (result.get("sbom_id") or "").strip()
             if resolved_sbom and not scan_sbom_id:
                 scan_sbom_id = resolved_sbom
-        return batch_idx, result
+        return result
 
-    def _collect(batch_idx: int, mcp_result: Dict[str, Any]) -> None:
+    def _scan_one(batch_idx: int, batch_files: List[str]) -> Tuple[int, List[Tuple[str, Dict[str, Any]]]]:
+        """Scan a top-level batch, splitting in half and retrying on 413
+        (request too large for the mcp SDK's 4 MiB body cap) until every leaf
+        either succeeds or can't be split further. Returns one (label,
+        result) pair per leaf batch that was actually sent."""
+
+        def _run(label: str, files: List[str]) -> List[Tuple[str, Dict[str, Any]]]:
+            try:
+                return [(label, _scan_leaf(label, files))]
+            except BaseException as exc:
+                split = _split_batch_in_half(files) if _is_payload_too_large(exc) else None
+                if not split:
+                    raise
+                first_half, second_half = split
+                logger.warning(
+                    "Batch %s: 413 Request Entity Too Large (%d files) — "
+                    "splitting into %d + %d files and retrying each half",
+                    label, len(files), len(first_half), len(second_half),
+                )
+                return _run(f"{label}a", first_half) + _run(f"{label}b", second_half)
+
+        return batch_idx, _run(str(batch_idx), batch_files)
+
+    def _collect(label: str, mcp_result: Dict[str, Any]) -> None:
         batch_actions = mcp_result.get("remediation_actions", [])
         batch_violations = list(mcp_result.get("violations") or [])
         if not batch_violations:
@@ -1273,8 +1314,8 @@ def parallel_batch_scan(
         batch_aibom = mcp_result.get("aibom", [])
         batch_stub_insertions = _stub_insertions_from_mcp_result(mcp_result)
         logger.info(
-            "Batch %d/%d done: status=%s violations=%d aibom=%d stub_insertions=%d",
-            batch_idx, len(batches), mcp_result.get("status", "unknown"),
+            "Batch %s/%d done: status=%s violations=%d aibom=%d stub_insertions=%d",
+            label, len(batches), mcp_result.get("status", "unknown"),
             len(batch_violations), len(batch_aibom), len(batch_stub_insertions),
         )
         with lock:
@@ -1295,8 +1336,9 @@ def parallel_batch_scan(
         for future in as_completed(future_map):
             batch_idx = future_map[future]
             try:
-                _, mcp_result = future.result()
-                _collect(batch_idx, mcp_result)
+                _, leaf_results = future.result()
+                for label, mcp_result in leaf_results:
+                    _collect(label, mcp_result)
             except BaseException as exc:
                 failed_batch_count += 1
                 detail = f"Batch {batch_idx}/{len(batches)} failed: {_describe_exception(exc)}"
@@ -1307,6 +1349,255 @@ def parallel_batch_scan(
         all_violations, all_remediation_actions, all_reports, all_aibom,
         failed_batch_count, failure_details, all_stub_insertions,
     )
+
+# ===========================================================================
+# Report merging — combine each batch's own markdown report (server-rendered,
+# one full "# LINEAJE AI POLICY REPORT" per batch) into a single report with
+# one Section 1 / 2 / 3 and one Enforcement Summary, instead of N reports
+# concatenated back-to-back (one per batch).
+# ===========================================================================
+
+_REPORT_SECTION_HEADERS = [
+    "## Enforcement Summary",
+    "### SECTION 1: AIBOM Discovery",
+    "### SECTION 2: Policy Violations",
+    "### SECTION 3: Controls Enforced",
+    "### AI Component Relationship Graph",
+    "### Phase Timing",
+]
+
+_ENFORCEMENT_PREVIEW_CAP = 12
+
+
+def _split_report_sections(report: str) -> Dict[str, str]:
+    """*report* → {header: content up to the next known header}, plus the
+    text before the first header under ``__preamble__``."""
+    positions = sorted(
+        (idx, h) for h in _REPORT_SECTION_HEADERS for idx in [report.find(h)] if idx != -1
+    )
+    sections: Dict[str, str] = {"__preamble__": report[: positions[0][0]] if positions else report}
+    for i, (idx, h) in enumerate(positions):
+        end = positions[i + 1][0] if i + 1 < len(positions) else len(report)
+        sections[h] = report[idx + len(h): end]
+    return sections
+
+
+def _table_rows(block: str) -> Tuple[Optional[str], Optional[str], List[str]]:
+    """First markdown table in *block* → (header row, separator row, data rows)."""
+    header = sep = None
+    data: List[str] = []
+    for line in block.splitlines():
+        s = line.rstrip()
+        if not s.lstrip().startswith("|"):
+            continue
+        if header is None:
+            header = s
+        elif sep is None:
+            sep = s
+        else:
+            data.append(s)
+    return header, sep, data
+
+
+def _enforcement_bullet_lines(block: str) -> List[str]:
+    """Bullet lines in an Enforcement Summary block — anything that isn't the
+    italic "…and N more" line, the "**Summary:**" line, or a table row."""
+    return [
+        line.strip() for line in block.splitlines()
+        if line.strip() and not line.strip().startswith(("*", "#", "|"))
+    ]
+
+
+def _mermaid_body(block: str) -> str:
+    m = re.search(r"```mermaid\n(.*?)```", block, re.DOTALL)
+    return m.group(1) if m else ""
+
+
+def _merge_mermaid_bodies(bodies: List[str]) -> str:
+    """Concatenate per-batch mermaid graphs into one, renaming node ids per
+    batch (``model_1`` → ``b0_model_1``) so batches never collide, and
+    deduping the (static, identical every time) ``classDef`` lines.
+
+    Node ids can appear more than once per line — as both endpoints of an
+    edge (``agent_4 -->|uses| model_7``), or as the subject of a ``class``
+    assignment — so renaming has to replace every whole-word occurrence of
+    a batch's declared ids in its own lines, not just a line's leading token.
+    """
+    node_def_lines: List[str] = []
+    other_lines: List[str] = []
+    classdef_lines: List[str] = []
+    seen_classdef: set = set()
+    for batch_idx, body in enumerate(bodies):
+        declared_ids = re.findall(r"^\s*(\w+)\s*[\[\(\{]", body, re.MULTILINE)
+        rename = {nid: f"b{batch_idx}_{nid}" for nid in declared_ids}
+        id_pattern = re.compile(r"\b(" + "|".join(re.escape(k) for k in rename) + r")\b") if rename else None
+
+        for raw_line in body.splitlines():
+            s = raw_line.strip()
+            if not s or s == "graph TD":
+                continue
+            if s.startswith("classDef"):
+                if s not in seen_classdef:
+                    seen_classdef.add(s)
+                    classdef_lines.append(s)
+                continue
+            renamed = id_pattern.sub(lambda m: rename[m.group(1)], s) if id_pattern else s
+            if re.match(r"^\w+\s*[\[\(\{]", s):
+                node_def_lines.append(renamed)
+            else:
+                other_lines.append(renamed)
+    lines = ["graph TD"] + [f"    {l}" for l in node_def_lines] + [f"    {l}" for l in other_lines]
+    if classdef_lines:
+        lines.append("")
+        lines.extend(f"    {l}" for l in classdef_lines)
+    return "\n".join(lines)
+
+
+def _dedupe_preserve_order(rows: List[str]) -> List[str]:
+    seen: set = set()
+    out: List[str] = []
+    for r in rows:
+        if r not in seen:
+            seen.add(r)
+            out.append(r)
+    return out
+
+
+def _merge_batch_reports(
+    reports: List[str],
+    *,
+    total_violations: int,
+    total_remediation_actions: int,
+    total_elapsed: float,
+) -> str:
+    """Combine each batch's own full markdown report into one report with a
+    single Enforcement Summary, Section 1 (AIBOM Discovery), Section 2
+    (Policy Violations), Section 3 (Controls Enforced), relationship graph,
+    and phase timing — rather than showing one full report per batch.
+    """
+    reports = [r for r in reports if r and r.strip()]
+    if not reports:
+        return ""
+    if len(reports) == 1:
+        return reports[0]
+
+    project_scanned = ""
+    enforcement_bullets: List[str] = []
+    s1_header = s1_sep = None
+    s1_rows: List[str] = []
+    s2_header = s2_sep = None
+    s2_rows: List[str] = []
+    s3_header = s3_sep = None
+    s3_rows: List[str] = []
+    mermaid_bodies: List[str] = []
+    phase_totals: Dict[str, float] = {}
+    phase_order: List[str] = []
+
+    for report in reports:
+        sections = _split_report_sections(report)
+        if not project_scanned:
+            m = re.search(r"\*\*Project Scanned:\*\*\s*`([^`]*)`", sections.get("__preamble__", ""))
+            if m:
+                project_scanned = m.group(1)
+
+        enforcement_bullets.extend(_enforcement_bullet_lines(sections.get("## Enforcement Summary", "")))
+
+        h, sep, rows = _table_rows(sections.get("### SECTION 1: AIBOM Discovery", ""))
+        s1_header, s1_sep = s1_header or h, s1_sep or sep
+        s1_rows.extend(rows)
+
+        h, sep, rows = _table_rows(sections.get("### SECTION 2: Policy Violations", ""))
+        s2_header, s2_sep = s2_header or h, s2_sep or sep
+        s2_rows.extend(rows)
+
+        h, sep, rows = _table_rows(sections.get("### SECTION 3: Controls Enforced", ""))
+        s3_header, s3_sep = s3_header or h, s3_sep or sep
+        s3_rows.extend(rows)
+
+        mermaid_bodies.append(_mermaid_body(sections.get("### AI Component Relationship Graph", "")))
+
+        _, _, phase_rows = _table_rows(sections.get("### Phase Timing", ""))
+        for row in phase_rows:
+            cells = [c.strip() for c in row.strip().strip("|").split("|")]
+            if len(cells) != 2:
+                continue
+            phase = cells[0].strip("*").strip()
+            m = re.match(r"([\d.]+)", cells[1].strip("*").strip())
+            if not m or phase.lower() == "total":
+                continue
+            if phase not in phase_totals:
+                phase_order.append(phase)
+            phase_totals[phase] = phase_totals.get(phase, 0.0) + float(m.group(1))
+
+    s1_rows = _dedupe_preserve_order(s1_rows)
+    s2_rows = _dedupe_preserve_order(s2_rows)
+    s3_rows = _dedupe_preserve_order(s3_rows)
+
+    lines: List[str] = ["# LINEAJE AI POLICY REPORT", ""]
+    status = "violations_found" if total_violations else "compliant"
+    lines.append(
+        f"**Run summary:** `{status}` · violations={total_violations} · "
+        f"remediation_actions={total_remediation_actions} · elapsed={total_elapsed:.1f}s"
+    )
+    lines.append("")
+    if project_scanned:
+        lines.append(f"**Project Scanned:** `{project_scanned}`")
+        lines.append("")
+    lines.append(f"**Total Time:** {total_elapsed:.1f}s")
+    lines.append("")
+    lines.append("---")
+    lines.append("")
+    lines.append("## Enforcement Summary")
+    lines.append("")
+    preview = enforcement_bullets[:_ENFORCEMENT_PREVIEW_CAP]
+    for bullet in preview:
+        lines.append(bullet)
+        lines.append("")
+    remaining = total_violations - len(preview)
+    if remaining > 0:
+        lines.append(f"*… and {remaining} more violation(s) — see **SECTION 3: Controls Enforced** below.*")
+        lines.append("")
+    lines.append(f"**Summary:** {len(preview)} notified")
+    lines.append("")
+    lines.append("---")
+    lines.append("")
+    lines.append("### SECTION 1: AIBOM Discovery")
+    lines.append("")
+    lines.append("#### AI Components")
+    lines.append("")
+    if s1_header:
+        lines.extend([s1_header, s1_sep, *s1_rows])
+    lines.append("")
+    lines.append("### SECTION 2: Policy Violations")
+    lines.append("")
+    lines.append("*Each row is one **`policy_violation=true`** finding (file × policy).*")
+    lines.append("")
+    if s2_header:
+        lines.extend([s2_header, s2_sep, *s2_rows])
+    lines.append("")
+    lines.append("### SECTION 3: Controls Enforced")
+    lines.append("")
+    lines.append("#### Controls enforced")
+    lines.append("")
+    if s3_header:
+        lines.extend([s3_header, s3_sep, *s3_rows])
+    lines.append("")
+    lines.append("### AI Component Relationship Graph")
+    lines.append("")
+    lines.append("```mermaid")
+    lines.append(_merge_mermaid_bodies(mermaid_bodies))
+    lines.append("```")
+    lines.append("")
+    lines.append("### Phase Timing")
+    lines.append("")
+    lines.append("| Phase | Time |")
+    lines.append("|-------|------|")
+    for phase in phase_order:
+        lines.append(f"| {phase} | {phase_totals[phase]:.1f}s |")
+    lines.append(f"| **Total** | **{sum(phase_totals.values()):.1f}s** |")
+    lines.append("")
+
+    return "\n".join(lines)
 
 # ===========================================================================
 # JSON output
@@ -1397,11 +1688,6 @@ def print_human_output(output: Dict[str, Any]) -> None:
     by_file: Dict[str, List[str]] = defaultdict(list)
     for v in violations:
         file_ = v.get("file") or v.get("file_path") or "(unknown)"
-        # The server's violation dicts key the policy name as "policy_name"
-        # (occasionally "policy_id" only) — "control" is a remediation_actions
-        # field, not a violations one, so reading it here always missed and
-        # printed "(unknown)" for every row. Mirrors gha_repo_scan.py's
-        # _violation_file_line_and_control fallback chain.
         control = v.get("policy_name") or v.get("control") or v.get("policy_id") or "(unknown)"
         by_file[file_].append(control)
 
@@ -1788,9 +2074,6 @@ def _create_fix_pr(
     sha_short = head_sha[:7]
     timestamp = time.strftime("%m%d%H%M")
     remediation_branch = f"{REMEDIATION_BRANCH_PREFIX}-{safe_branch.replace('/', '-')}-{sha_short}-{timestamp}"
-
-    # Creating a ref requires the full 40-char object id. Build.SourceVersion
-    # already is one, so this only matters when --head-sha was passed by hand.
     if len(head_sha) < 40:
         resolved: Optional[str] = None
         try:
@@ -1856,11 +2139,6 @@ def _create_fix_pr(
         "",
         failed_list,
     ])
-
-    # Azure DevOps caps PR descriptions at 4000 characters and does not render
-    # the <details> element the GitHub edition used, so the report only rides
-    # along when it fits. The pipeline publishes the full text as the
-    # unifai-report artifact either way.
     if report:
         heading = "\n\n---\n\n### Scan report\n\n"
         tail = "\n\n---\n\n*Full scan report: see the `unifai-report` artifact on the pipeline run.*"
@@ -1996,7 +2274,12 @@ def _execute_scan(args: argparse.Namespace) -> int:
         elapsed, len(all_violations), len(all_aibom), failed_batches_count,
     )
 
-    combined_report = "\n\n---\n\n".join(r for r in all_reports if r)
+    combined_report = _merge_batch_reports(
+        all_reports,
+        total_violations=len(all_violations),
+        total_remediation_actions=len(all_remediation_actions),
+        total_elapsed=elapsed,
+    )
 
     if failed_batches_count and not all_violations:
         output = build_json_output(
@@ -2060,8 +2343,6 @@ def _execute_scan(args: argparse.Namespace) -> int:
             ("SYSTEM_TEAMPROJECT / --project", project),
         ] if not v]
 
-    # Write .lineaje/guardrail.json only when a PR was requested — a plain
-    # scan must not modify the input branch's working tree.
     if should_create_pr:
         _ensure_refresh_token_in_validated_fixes(
             validated_fixes, os.environ.get("LINEAJE_PAT_TOKEN", ""), source_path,
