@@ -4,6 +4,26 @@ OpenAI-compatible model gateway client.
 This keeps the request shape real and makes the selected model visible in each
 agent file via the `model=` argument on every call.
 """
+# Copyright (c) Lineaje, Inc. All rights reserved.
+# Lineaje UnifAI guardrail  version=2.0.0-alpha
+# Each enforce() call site below carries a SiteDescriptor with:
+#   site_id            deterministic id for this exact call site (file +
+#                      symbol + insertion point + pattern) — stable across
+#                      re-scans, used to dedupe stub insertions and to look
+#                      up this site's policy mapping at runtime.
+#   candidate_policies policy IDs this site matched during the scan.
+def _lineaje_load_gr_client():
+    """Lineaje-added: load gr_stub_client.py without a pip dependency."""
+    import sys as _s, importlib.util as _ilu
+    from pathlib import Path as _P
+    n = "_lineaje_gr_stub_client"
+    if n in _s.modules: return _s.modules[n]
+    h = _P(__file__).resolve().parent
+    _cand = next((d / "gr_stub_client.py" for d in [h, *h.parents][:8] if (d / "gr_stub_client.py").is_file()), h / "gr_stub_client.py")
+    _spec = _ilu.spec_from_file_location(n, _cand)
+    _s.modules[n] = _m = _ilu.module_from_spec(_spec)
+    _spec.loader.exec_module(_m); return _m
+
 
 import asyncio
 import logging
@@ -57,18 +77,31 @@ class OpenAICompatibleClient:
                     headers=headers,
                     timeout=20,
                 )
+                # LINEAJE: enforce() `response` at api->agent post_tool — scan flagged AI_APP_SEC_038 (The AI Model must validate and sanitize any input before processing.); AI_APP_SEC_039 (Sanitize and validate all input to the AI Model.); AI_APP_SEC_059 (Do not allow prompts that can execute malicious commands at runtime.). Mask/block; do not remove without review. site_id='site:sha256:98bf62bcf63737cb4c93e6a9af71c337f7236fbb6fc04a46560d3ecfc4f2128e'
+                _gr_client = _lineaje_load_gr_client()
+                _gr_site = _gr_client.SiteDescriptor(site_id='site:sha256:98bf62bcf63737cb4c93e6a9af71c337f7236fbb6fc04a46560d3ecfc4f2128e', phase='post_tool', boundary={'source': 'external_endpoint', 'sink': 'agent_message'}, candidate_policies=[{'policy_id': 'AI_APP_SEC_038', 'guardrail_id': None, 'policy_version': None}, {'policy_id': 'AI_APP_SEC_039', 'guardrail_id': None, 'policy_version': None}, {'policy_id': 'AI_APP_SEC_059', 'guardrail_id': None, 'policy_version': None}], fail_mode='ALLOW_WITH_AUDIT', source_type='api', destination_type='agent')
+                response = _gr_client.enforce(_gr_site, response, content_type='application/json', variable_name='response', source_file=__file__, before_line=54)
                 response.raise_for_status()
                 data = response.json()
                 choices = data.get("choices", [])
                 if choices:
                     message = choices[0].get("message", {})
+                    # LINEAJE: enforce() `message` at api->agent post_tool — scan flagged AI_APP_SEC_071 (Enforce chemical, biological, radiological, or nuclear (CBRN) threat prevention safeguards in AI-enabled systems); AI_IAC_015 (Enforce URL allowlists for agent fetches, tools, and outbound HTTP.); AI_IAC_024 (General purpose AI model integrations must reference a model card or technical documentation). Mask/block; do not remove without review. site_id='site:sha256:73c7ae65179045b5518de53c90348c364df22d56308dc50e84af84ecec964a93'
+                    _gr_client = _lineaje_load_gr_client()
+                    _gr_site = _gr_client.SiteDescriptor(site_id='site:sha256:73c7ae65179045b5518de53c90348c364df22d56308dc50e84af84ecec964a93', phase='post_tool', boundary={'source': 'external_endpoint', 'sink': 'agent_message'}, candidate_policies=[{'policy_id': 'AI_APP_SEC_071', 'guardrail_id': None, 'policy_version': None}, {'policy_id': 'AI_IAC_015', 'guardrail_id': None, 'policy_version': None}, {'policy_id': 'AI_IAC_024', 'guardrail_id': None, 'policy_version': None}, {'policy_id': 'AI_DAT_SEC_027', 'guardrail_id': 'Minimise and redact all outbound AI outputs.', 'policy_version': '2026.08.1'}], fail_mode='ALLOW_WITH_AUDIT', source_type='api', destination_type='agent')
+                    message = _gr_client.enforce(_gr_site, message, content_type='application/json', variable_name='message', source_file=__file__, before_line=64)
                     content = message.get("content", "")
                     if isinstance(content, str):
                         return content.strip()
                 return f"Model API returned no content for model {model}."
             except requests.RequestException as exc:
+                _lineaje_payload = "Model gateway request failed"
+                # LINEAJE: enforce() `_lineaje_payload` at agent->log log_emit — scan flagged AI_APP_SEC_006 (Use only LLMs from the organization's approved list.); AI_APP_SEC_029 (Agent must validate, sanitize LLM output including for presence of eval or any dynamic code execution primitive in LLM output.); AI_APP_SEC_039 (Sanitize and validate all input to the AI Model.). Mask/block; do not remove without review. site_id='site:sha256:43f281407de8ee4454d2b0b7402c01a7036fee1885dc25855039e04b239fec1a'
+                _gr_client = _lineaje_load_gr_client()
+                _gr_site = _gr_client.SiteDescriptor(site_id='site:sha256:43f281407de8ee4454d2b0b7402c01a7036fee1885dc25855039e04b239fec1a', phase='log_emit', boundary={'source': 'log', 'sink': 'log'}, candidate_policies=[{'policy_id': 'AI_DAT_SEC_010', 'guardrail_id': 'Mask PII in Logs', 'policy_version': '2026.08.1'}, {'policy_id': 'AI_APP_SEC_006', 'guardrail_id': 'Enforce Approved LLM.', 'policy_version': '2026.08.1'}, {'policy_id': 'AI_APP_SEC_029', 'guardrail_id': None, 'policy_version': None}, {'policy_id': 'AI_APP_SEC_039', 'guardrail_id': None, 'policy_version': None}, {'policy_id': 'AI_APP_SEC_040', 'guardrail_id': None, 'policy_version': None}, {'policy_id': 'AI_APP_SEC_059', 'guardrail_id': None, 'policy_version': None}, {'policy_id': 'AI_APP_SEC_071', 'guardrail_id': None, 'policy_version': None}, {'policy_id': 'AI_DAT_SEC_023', 'guardrail_id': 'Redact PII from uploaded files', 'policy_version': '2026.08.1'}, {'policy_id': 'AI_DAT_SEC_024', 'guardrail_id': 'Redact PII (Singapore) from contents ofuploaded files', 'policy_version': '2026.08.1'}, {'policy_id': 'AI_IAC_015', 'guardrail_id': None, 'policy_version': None}, {'policy_id': 'AI_IAC_024', 'guardrail_id': None, 'policy_version': None}, {'policy_id': 'AI_DAT_SEC_027', 'guardrail_id': 'Minimise and redact all outbound AI outputs.', 'policy_version': '2026.08.1'}], fail_mode='BLOCK', source_type='agent', destination_type='log')
+                _lineaje_payload = _gr_client.enforce(_gr_site, _lineaje_payload, content_type='application/json')
                 logger.warning(
-                    "Model gateway request failed",
+                    _lineaje_payload,
                     extra={"model": model, "error": str(exc)},
                 )
                 return f"Model gateway unavailable for {model}: {exc}"
