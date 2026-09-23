@@ -1,4 +1,24 @@
 """Orchestrator Agent class with explicit model invocation."""
+# Copyright (c) Lineaje, Inc. All rights reserved.
+# Lineaje UnifAI guardrail  version=2.0.0-alpha
+# Each enforce() call site below carries a SiteDescriptor with:
+#   site_id            deterministic id for this exact call site (file +
+#                      symbol + insertion point + pattern) — stable across
+#                      re-scans, used to dedupe stub insertions and to look
+#                      up this site's policy mapping at runtime.
+#   candidate_policies policy IDs this site matched during the scan.
+def _lineaje_load_gr_client():
+    """Lineaje-added: load gr_stub_client.py without a pip dependency."""
+    import sys as _s, importlib.util as _ilu
+    from pathlib import Path as _P
+    n = "_lineaje_gr_stub_client"
+    if n in _s.modules: return _s.modules[n]
+    h = _P(__file__).resolve().parent
+    _cand = next((d / "gr_stub_client.py" for d in [h, *h.parents][:8] if (d / "gr_stub_client.py").is_file()), h / "gr_stub_client.py")
+    _spec = _ilu.spec_from_file_location(n, _cand)
+    _s.modules[n] = _m = _ilu.module_from_spec(_spec)
+    _spec.loader.exec_module(_m); return _m
+
 
 import logging
 from typing import Any
@@ -64,14 +84,33 @@ class OrchestratorAgent(AcmeLoanAgentFramework):
         forwarded_context["internal_call_chain"] = [self.AGENT_NAME, selected_agent_name]
         forwarded_context["internal_hop_token"] = "shared-orchestrator-hop-token"
 
+        _lineaje_payload = "Orchestrator Agent routing request"
+        # LINEAJE: enforce() `_lineaje_payload` at agent->log log_emit — scan flagged AI_APP_SEC_006 (Use only LLMs from the organization's approved list.). Mask/block; do not remove without review. site_id='site:sha256:2f989c04e85ce464a8e3c6400b0a5a29a71060cd43bf9f475a3954f132ab04a0'
+        _gr_client = _lineaje_load_gr_client()
+        _gr_site = _gr_client.SiteDescriptor(site_id='site:sha256:2f989c04e85ce464a8e3c6400b0a5a29a71060cd43bf9f475a3954f132ab04a0', phase='log_emit', boundary={'source': 'log', 'sink': 'log'}, candidate_policies=[{'policy_id': 'AI_DAT_SEC_010', 'guardrail_id': 'Mask PII in Logs', 'policy_version': '2026.08.1'}], fail_mode='BLOCK', source_type='agent', destination_type='log')
+        try:
+            _lineaje_payload = await __import__('asyncio').to_thread(lambda: _gr_client.enforce(_gr_site, _lineaje_payload, content_type='application/json'))
+        except _gr_client.GuardrailUnavailableError:
+            pass
+        except PermissionError:
+            pass
         logger.info(
-            "Orchestrator Agent routing request",
+            _lineaje_payload,
             extra={
                 "selected_agent": selected_agent_name,
                 "internal_call_chain": forwarded_context["internal_call_chain"],
             },
         )
 
+        # LINEAJE: enforce() `selected_agent_name` at agent->llm pre_model — scan flagged AI_APP_SEC_006 (Use only LLMs from the organization's approved list.); AI_APP_SEC_070 (Detect and block all forms of prompt injection attacks in user inputs and file contents). Mask/block; do not remove without review. site_id='site:sha256:d6efea20d79f7339b68de3727c847b4cb8dff8eabec9475924c2637c15605f81'
+        _gr_client = _lineaje_load_gr_client()
+        _gr_site = _gr_client.SiteDescriptor(site_id='site:sha256:d6efea20d79f7339b68de3727c847b4cb8dff8eabec9475924c2637c15605f81', phase='pre_model', boundary={'source': 'agent_message', 'sink': 'model'}, candidate_policies=[{'policy_id': 'AI_APP_SEC_006', 'guardrail_id': 'Enforce Approved LLM.', 'policy_version': '2026.08.1'}, {'policy_id': 'AI_APP_SEC_028', 'guardrail_id': 'Enforce Approved LLM', 'policy_version': '2026.08.1'}, {'policy_id': 'AI_APP_SEC_070', 'guardrail_id': 'Sanitize Prompt Injection', 'policy_version': '2026.08.1'}, {'policy_id': 'AI_DAT_SEC_011', 'guardrail_id': 'Redact PII', 'policy_version': '2026.08.1'}, {'policy_id': 'AI_DAT_SEC_029', 'guardrail_id': 'Emit immutable, forensic-ready audit records for all AI decisions.', 'policy_version': '2026.08.1'}], fail_mode='BLOCK', source_type='agent', destination_type='llm')
+        try:
+            selected_agent_name = await __import__('asyncio').to_thread(lambda: _gr_client.enforce(_gr_site, selected_agent_name, content_type='application/json', variable_name='selected_agent_name', source_file=__file__, before_line=75))
+        except _gr_client.GuardrailUnavailableError:
+            pass
+        except PermissionError:
+            raise
         routing_note = await self.call_agent_model(
             context.get("user_message", ""),
             selected_agent_name,
@@ -79,6 +118,15 @@ class OrchestratorAgent(AcmeLoanAgentFramework):
         response = await selected_agent.handle(forwarded_context)
         response["orchestrator"] = self.AGENT_NAME
         response["routing_note"] = routing_note
+        # LINEAJE: enforce() `response` at agent->user_interface data_egress — scan flagged AI_APP_SEC_006 (Use only LLMs from the organization's approved list.). Mask/block; do not remove without review. site_id='site:sha256:728d0c5aa3c4919ecd2548d7268f00f18efd85878270cc125539b0b1d7a5762b'
+        _gr_client = _lineaje_load_gr_client()
+        _gr_site = _gr_client.SiteDescriptor(site_id='site:sha256:728d0c5aa3c4919ecd2548d7268f00f18efd85878270cc125539b0b1d7a5762b', phase='data_egress', boundary={'source': 'agent_message', 'sink': 'user_interface'}, candidate_policies=[{'policy_id': 'AI_DAT_SEC_012', 'guardrail_id': 'Mask PII on UI', 'policy_version': '2026.08.1'}], fail_mode='BLOCK', source_type='agent', destination_type='user_interface')
+        try:
+            response = _gr_client.enforce(_gr_site, response, content_type='text/plain')
+        except _gr_client.GuardrailUnavailableError:
+            pass
+        except PermissionError:
+            pass
         return response
 
     def select_agent(self, user_message: str, file_contents: list[dict[str, Any]]) -> AcmeLoanAgentFramework:
